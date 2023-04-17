@@ -9,7 +9,8 @@ import os
 from models import LadderVAE, BetaVAE, LatentLadderVAE
 from torch import autograd
 from mtl_gradient import pc_backward
-from agd import AGD
+from dataset import OODDataset
+
 
 autograd.set_detect_anomaly(True)
 
@@ -47,16 +48,21 @@ class Trainer:
     def on_epoch_end(self):
         self.beta_scheduler.step()
 
-    def train_step(self, x, y):
+    def train_step(self, x, y, x_out, y_out):
         self.model.train()
-        self.model.zero_grad()
+        self.optimizer.zero_grad()
         y_onehot = F.one_hot(y, num_classes=self.num_classes).float().to(self.device)
 
         # Forward pass
+        # in-distribution
         logits, embedding_y, latent_mu, latent_var, x_rec, dec_mu_list, dec_var_list, q_mu_list, q_var_list, mu = \
             self.model(x, y=y_onehot)
+        
+        # out-of-distribution
+        logits_out, _, _, _, x_rec_out, *_  = self.model(x_out, y=None)[4]
+        
 
-        # Compute loss
+        # Compute in-distribution loss
         loss, rec_loss, kl_loss, entropy_loss = self.model.compute_loss(x=x,
                                                                         y=y,
                                                                         logits=logits,
@@ -70,9 +76,25 @@ class Trainer:
                                                                         q_var_list=q_var_list,
                                                                         beta_kl=self.beta_scheduler.value,
                                                                         beta_entropy=self.beta_entropy)
+        
+
+        # compute out-of-distribution loss
+        # Maximize entropy of out-of-distribution data
+        entropy_out = 0.5 * -(logits_out.mean(1) - torch.logsumexp(logits_out, dim=1)).mean()
+        # Maximize reconstruction error of out-of-distribution data
+        rec_loss_out = F.mse_loss(x_out, x_rec_out, reduction='none')
+        if y_out is not None:
+            # y_out is a mask
+            # Weight the reconstruction loss by the mask
+            # i.e., the foreground has higher weight and background has lower weight
+            rec_loss_out = y_out * rec_loss_out
+        rec_loss_out = rec_loss_out.sum(dim=(1,2,3)).mean(0)
+        loss_out = entropy_out - rec_loss_out
 
         self.optimizer.zero_grad()
-        # pc_backward([rec_loss, kl_loss, entropy_loss], self.optimizer)
+
+        loss += 0.1 * loss_out
+        # pc_backward([rec_loss, kl_loss, entropy_loss, entropy_out, rec_loss_out], self.optimizer)
         loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), 1.)
         self.optimizer.step()
@@ -138,7 +160,7 @@ class AverageMetrics:
                self.entropy_loss / self.num_samples
 
 
-def train(args, trainer, train_loader, val_loader):
+def train(args, trainer, train_loader, val_loader, loader_ood):
     best_val_loss = float('inf')
     os.makedirs(f'checkpoints/{args.model}{args.beta_entropy}', exist_ok=True)
     with open(f'checkpoints/{args.model}{args.beta_entropy}/{args.dataset}_train_loss.txt', 'w') as f:
@@ -155,6 +177,8 @@ def train(args, trainer, train_loader, val_loader):
     train_metrics = AverageMetrics()
     val_metrics = AverageMetrics()
 
+    # OOD data generator
+    iter_ood = iter(loader_ood)
     for epoch in range(args.epochs):
 
         if epoch in args.lr_steps:
@@ -162,9 +186,23 @@ def train(args, trainer, train_loader, val_loader):
             print("learning rate:", trainer.optimizer.param_groups[0]['lr'])
         train_metrics.reset()
         for batch_idx, (x, y) in enumerate(train_loader):
+
+            # Get the next OOD data
+            try:
+                x_ood, y_ood = next(iter_ood)
+            except StopIteration:
+                iter_ood = iter(loader_ood)
+                x_ood, y_ood = next(iter_ood)
+
             x, y = x.to(trainer.device), y.to(trainer.device)
+            x_ood, y_ood = x_ood.to(trainer.device), y_ood.to(trainer.device)
+            if not loader_ood.has_mask:
+                # The reconstruction loss is equally maximized across the foreground
+                # and the background
+                y_ood = None
+
             # Train step
-            logits, mu, x_rec, loss, rec_loss, kl_loss, entropy_loss = trainer.train_step(x, y)
+            logits, mu, x_rec, loss, rec_loss, kl_loss, entropy_loss = trainer.train_step(x, y, x_ood, y_ood)
             pred_labels = logits.argmax(-1)
             correct = torch.eq(pred_labels, y).sum().item()
             total = x.size(0)
@@ -232,6 +270,8 @@ def main():
     parser.add_argument('--beta_entropy', type=int, default=100, help='Cross-entropy loss weight')
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    
     if args.dataset == 'cifar10':
         d = {'in_channels': 3, 'img_size': (32, 32), 'num_classes': 10}
         args = argparse.Namespace(**vars(args), **d)
@@ -239,6 +279,8 @@ def main():
             # lambda x: x.convert('L'),  # grayscale
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))])
+        
+        # in-distribution data
         train_dataset = datasets.CIFAR10('data/cifarpy', download=True, train=True, transform=transform)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -284,11 +326,16 @@ def main():
 
     else:
         raise NotImplementedError("Model not implemented")
+
+
+    # Out-of-distribution data
+    dataset_ood = OODDataset(root=args.ood_path, transform=transforms)
+    loader_ood = DataLoader(dataset_ood, args.batch_size, shuffle=True)
+
     print("Model number of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
     model.to(device)
     # optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.wd)
-    # optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)  #
-    optimizer = AGD(model)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)  #
     if args.model == 'vae':
         beta_scheduler = BetaScheduler(max_steps=50, max_value=1., model=args.model)
     elif args.model == 'lvae' or args.model == 'llvae':
@@ -298,7 +345,7 @@ def main():
         raise NotImplementedError("Beta scheduler not implemented")
     trainer = Trainer(model, optimizer, beta_scheduler, beta_entropy=args.beta_entropy, num_classes=args.num_classes,
                       device=device)
-    train(args, trainer, train_loader, val_loader)
+    train(args, trainer, train_loader, val_loader, loader_ood)
 
 
 if __name__ == "__main__":

@@ -226,7 +226,8 @@ class LadderVAE(nn.Module):
                      beta_kl, beta_entropy):
         assert embedding_y is not None, "embedding_y is None."
         # Reconstruction loss
-        rec_loss = (x - x_rec).pow(2).sum(dim=(1, 2, 3)).mean()
+        # rec_loss = F.mse_loss(x, x_rec, reduction='none').sum(dim=(1, 2, 3)).mean()
+        rec_loss = F.mse_loss(x, x_rec)
         # KL loss with class-conditional prior
         prior_mu, prior_var = torch.zeros_like(embedding_y), torch.ones_like(embedding_y)
         kl_loss = utils.kl_normal(latent_mu, latent_var, prior_mu, prior_var, embedding_y)

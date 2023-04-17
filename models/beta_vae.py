@@ -171,7 +171,7 @@ class BetaVAE(nn.Module):
         # Reconstruction loss
         # rec_loss = F.mse_loss(x, x_rec)
         # rec_loss = F.binary_cross_entropy_with_logits(x_rec, torch.zeros_like(x_rec), reduction='none').sum(dim=(1, 2, 3)).mean()
-        rec_loss = (x - x_rec).pow(2).sum(dim=(1, 2, 3)).mean()
+        rec_loss = F.mse_loss(x, x_rec, reduction='none').sum(dim=(1, 2, 3)).mean()
         # KL Divergence loss
         kl_loss = 0.5 * (-torch.log(latent_var) + latent_var + (latent_mu - embedding_y).pow(2) - 1)
         kl_loss = kl_loss.sum(-1).mean()
